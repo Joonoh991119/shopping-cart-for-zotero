@@ -47,7 +47,7 @@ except ImportError:
 PORT = 8765
 DEFAULT_ZOTERO = str(Path.home() / "Zotero")
 EMAIL = "vnilab@gmail.com"
-SCIHUB = ["https://sci-hub.se", "https://sci-hub.st", "https://sci-hub.ru"]
+SCIHUB = ["https://sci-hub.kr", "https://sci-hub.ru", "https://sci-hub.se", "https://sci-hub.st"]
 TIMEOUT = 30
 DELAY = 2
 
@@ -127,23 +127,48 @@ def _unpaywall(doi, dest):
     try:
         r = requests.get(f"https://api.unpaywall.org/v2/{urllib.parse.quote(doi,safe='')}?email={EMAIL}", timeout=TIMEOUT)
         if r.status_code != 200: return False
-        b = r.json().get("best_oa_location")
-        if not b: return False
-        u = b.get("url_for_pdf") or b.get("url")
-        return _dl(u, dest) if u else False
+        data = r.json()
+        # Try ALL OA locations — repositories (PMC) often work when publishers block bots
+        for loc in data.get("oa_locations", []):
+            u = loc.get("url_for_pdf") or loc.get("url")
+            if u and _dl(u, dest): return True
+        return False
     except: return False
+
+def _europepmc(doi, dest):
+    """EuropePMC fallback — find PMCID, download via render endpoint."""
+    try:
+        r = requests.get(f"https://www.ebi.ac.uk/europepmc/webservices/rest/search?query=DOI:{doi}&format=json&resultType=core", timeout=TIMEOUT)
+        if r.status_code != 200: return False
+        results = r.json().get("resultList", {}).get("result", [])
+        if not results: return False
+        pmcid = results[0].get("pmcid", "")
+        if not pmcid: return False
+        if _dl(f"https://europepmc.org/backend/ptpmcrender.fcgi?accid={pmcid}&blobtype=pdf", dest): return True
+        return _dl(f"https://pmc.ncbi.nlm.nih.gov/articles/{pmcid}/pdf/", dest)
+    except: return False
+
+# ── Sci-Hub session (separate from main session to avoid 403) ──
+_SH = requests.Session()
+_SH.headers.update({"User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+    "AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36"})
 
 def _scihub(doi, dest):
     for m in SCIHUB:
         try:
-            r = S.get(f"{m}/{doi}", timeout=TIMEOUT)
+            r = _SH.get(f"{m}/{doi}", timeout=TIMEOUT)
             if r.status_code != 200: continue
-            x = re.search(r'(?:iframe|embed)[^>]*src=["\']([^"\']*\.pdf[^"\']*)["\']', r.text, re.I)
-            if not x: x = re.search(r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)', r.text, re.I)
-            if not x: continue
-            u = x.group(1)
-            if u.startswith("//"): u = "https:" + u
-            if _dl(u, dest): return True
+            # Extended patterns: object data, citation_pdf_url, iframe/embed, direct link
+            for pat in [r'<object[^>]*data\s*=\s*["\']([^"\']*\.pdf[^"\']*)["\']',
+                        r'citation_pdf_url["\'][^>]*content\s*=\s*["\']([^"\']+)["\']',
+                        r'(?:iframe|embed)[^>]*src\s*=\s*["\']([^"\']*\.pdf[^"\']*)["\']',
+                        r'(https?://[^\s"\'<>]+\.pdf[^\s"\'<>]*)']:
+                x = re.search(pat, r.text, re.I)
+                if not x: continue
+                u = x.group(1).split("#")[0]  # Remove URL fragment
+                if u.startswith("//"): u = "https:" + u
+                elif u.startswith("/"): u = m + u
+                if _dl(u, dest): return True
         except: continue
     return False
 
@@ -159,8 +184,15 @@ def _pub_patterns(url, doi):
     if "plos" in u:
         x = re.search(r'article\?id=([\d.]+/[\w.]+)', u)
         if x: ps.append(f"https://journals.plos.org/plosone/article/file?id={x.group(1)}&type=printable")
-    if "pnas.org" in u or "academic.oup.com" in u:
+    if "pnas.org" in u:
+        ps.append(url.replace("/doi/full/","/doi/pdf/"))
+        ps.append(url.replace("/doi/abs/","/doi/pdf/"))
         ps.append(url.rstrip("/")+".full.pdf")
+    if "academic.oup.com" in u:
+        ps.append(url.rstrip("/")+".full.pdf")
+    if "royalsocietypublishing.org" in u:
+        ps.append(url.replace("/doi/full/","/doi/pdf/"))
+        ps.append(url.replace("/doi/abs/","/doi/pdf/"))
     if "frontiersin.org" in u or "mdpi.com" in u:
         ps.append(url.rstrip("/")+"/pdf")
     return ps
@@ -185,7 +217,7 @@ def _direct(doi, dest):
 def download_pdf(doi, dl_dir):
     safe = re.sub(r'[^\w\-.]','_',doi)+".pdf"
     dest = dl_dir / safe
-    for name, fn in [("unpaywall",_unpaywall),("scihub",_scihub),("direct",_direct)]:
+    for name, fn in [("unpaywall",_unpaywall),("europepmc",_europepmc),("scihub",_scihub),("direct",_direct)]:
         if fn(doi, dest): return (True, dest, name)
         time.sleep(0.5)
     if dest.exists(): dest.unlink()
@@ -211,7 +243,7 @@ class ZDB:
         bp = self.db.parent/f"zotero_backup_{int(time.time())}.sqlite"
         shutil.copy2(self.db, bp); return bp
     def _key(self):
-        ch = string.ascii_uppercase+string.digits
+        ch = "23456789ABCDEFGHIJKMNPQRSTUVWXZ"  # Zotero valid key chars (no 0,1,L,O)
         while True:
             k="".join(random.choices(ch,k=8))
             if k not in self._k: self._k.add(k); return k
