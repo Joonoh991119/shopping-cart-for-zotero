@@ -135,6 +135,20 @@ def _unpaywall(doi, dest):
         return False
     except: return False
 
+def _crossref_links(doi, dest):
+    """Try PDF links from CrossRef metadata — works for MIT Press, some others."""
+    try:
+        r = requests.get(f"https://api.crossref.org/works/{urllib.parse.quote(doi,safe='')}",
+                        headers={"User-Agent": f"doi2zotero/2.0 (mailto:{EMAIL})"}, timeout=TIMEOUT)
+        if r.status_code != 200: return False
+        links = r.json().get("message", {}).get("link", [])
+        for link in links:
+            url = link.get("URL", "")
+            ct = link.get("content-type", "")
+            if ("pdf" in ct.lower() or "unspecified" in ct.lower()) and _dl(url, dest): return True
+        return False
+    except: return False
+
 def _europepmc(doi, dest):
     """EuropePMC fallback — find PMCID, download via render endpoint."""
     try:
@@ -217,7 +231,7 @@ def _direct(doi, dest):
 def download_pdf(doi, dl_dir):
     safe = re.sub(r'[^\w\-.]','_',doi)+".pdf"
     dest = dl_dir / safe
-    for name, fn in [("unpaywall",_unpaywall),("europepmc",_europepmc),("scihub",_scihub),("direct",_direct)]:
+    for name, fn in [("unpaywall",_unpaywall),("crossref",_crossref_links),("europepmc",_europepmc),("scihub",_scihub),("direct",_direct)]:
         if fn(doi, dest): return (True, dest, name)
         time.sleep(0.5)
     if dest.exists(): dest.unlink()
